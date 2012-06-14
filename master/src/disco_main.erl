@@ -34,6 +34,7 @@ write_pid(PidFile) ->
 -spec start(_, _) -> {'ok', pid()} | {'error', term()}.
 start(_Type, _Args) ->
     ok = application:start(lager),
+
     init_settings(),
     write_pid(disco:get_setting("DISCO_MASTER_PID")),
     Port = disco:get_setting("DISCO_PORT"),

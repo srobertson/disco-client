@@ -16,7 +16,8 @@ start(MochiConfig) ->
         {name, ddfs_put},
         {max, ?HTTP_MAX_CONNS},
         {loop, fun(Req) ->
-                    loop(Req:get(path), Req)
+                       disco_aws:set_aws_creds(),                        
+                       loop(Req:get(path), Req)
                 end}
         | MochiConfig]).
 
@@ -89,6 +90,9 @@ receive_blob(Req, IO, Dst, Url) ->
             % file should not be corrupted.
             case ddfs_util:safe_rename(Dst, Dir) of
                 ok ->
+                    {ok, Contents} = file:read_file(Dir),
+                    disco_aws:spawn_put(?S3_BUCKET, Dir, Contents),
+
                     Req:respond({201,
                         [{"content-type", "application/json"}],
                             ["\"", Url, "\""]});

@@ -21,6 +21,14 @@
 -spec start_link(term()) -> no_return().
 start_link(Config) ->
     process_flag(trap_exit, true),
+
+    ok = application:start(crypto),
+    ok = application:start(public_key),
+    ok = application:start(ssl),
+    ok = application:start(inets),
+    ok = application:start(xmerl),
+    ok = application:start(erlcloud),
+
     error_logger:info_msg("DDFS node starts on ~p", [node()]),
     case catch gen_server:start_link(
             {local, ddfs_node}, ddfs_node, Config, [{timeout, ?NODE_STARTUP}]) of
@@ -272,6 +280,9 @@ do_put_tag_commit(Tag, TagVol, S) ->
     Dst = filename:join(Local,  TagL),
     case ddfs_util:safe_rename(Src, Dst) of
         ok ->
+            {ok, Contents} = file:read_file(Dst),
+            disco_aws:spawn_put(?S3_BUCKET, Dst, Contents),
+
             {{ok, Url},
              S#state{tags = gb_trees:enter(TagName,
                                            {Time, VolName},

@@ -3,6 +3,7 @@
   {vsn, git},
   {registered, [disco_server, event_server]},
   {applications, [kernel, stdlib]},
+  {included_applications, [erlcloud]},     
   {mod, {disco_main, []}},
   {env, []},
   {modules,[]}]}.
