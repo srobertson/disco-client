@@ -294,7 +294,7 @@ read_file(TagPath) ->
 
 -spec read_file(s3_node | std_node, list() | binary()) -> {ok, binary()} | {error, term()}.
 read_file(s3_node, TagPath) ->
-    read_file(std_node, TagPath);
+    disco_aws:read(get(s3_bucket), TagPath);
 read_file(std_node, TagPath) ->
     prim_file:read_file(TagPath).
 
@@ -304,7 +304,7 @@ write_file(Filename, Data) ->
 
 -spec write_file(s3_node | std_node, list() | binary(), binary()) -> ok | {error, term()}.
 write_file(s3_node, Filename, Data) ->
-    write_file(std_node, Filename, Data);
+    disco_aws:spawn_put(get(s3_bucket), Filename, Data);
 write_file(std_node, Filename, Data) ->
     prim_file:write_file(Filename, Data).
 
@@ -324,6 +324,6 @@ list_dir(Root) ->
 
 -spec list_dir(s3_node | std_node, list()) -> {ok, list()} | {error, term()}.          
 list_dir(s3_node, Root) ->
-    list_dir(std_node, Root);
+    disco_aws:list_objects(Root);
 list_dir(std_node, Root) ->
     prim_file:list_dir(Root).

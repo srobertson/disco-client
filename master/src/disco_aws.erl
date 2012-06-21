@@ -10,6 +10,8 @@
 
 %% API
 -export([spawn_put/3,
+         read/2,
+         list_objects/1,
          set_aws_creds/0]).
 
 %%%===================================================================
@@ -22,6 +24,14 @@ spawn_put(Bucket, Dir, Contents) ->
     proc_lib:spawn(fun()->                       
                            erlcloud_s3:put_object(Bucket, binary_to_list(Dir), Contents, Creds) 
                    end).
+
+-spec read(string(), string()) -> {ok, binary()}.
+read(Bucket, TagPath) ->
+    erlcloud_s3:get_object(Bucket, TagPath).
+
+-spec list_objects(string()) -> {ok, list()}.
+list_objects(Root) ->
+    erlcloud_s3:list_objects(Root).
 
 -spec set_aws_creds() -> record().
 set_aws_creds() ->
