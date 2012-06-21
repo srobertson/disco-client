@@ -135,8 +135,12 @@ start_ddfs_node(Host, Node, DiscoRoot,
                 #node_ports{put_port = PutPort, get_port = GetPort},
                 {GetEnabled, PutEnabled}) ->
     DdfsRoot = disco:ddfs_root(disco:get_setting("DDFS_DATA"), Host),
+    UseS3 = string:equal(disco:get_setting("DISCO_USE_S3"), "true"),
+    S3Bucket = disco:get_setting("DISCO_S3_BUCKET"),
+
     Args = [{nodename, Host},
             {disco_root, DiscoRoot}, {ddfs_root, DdfsRoot},
             {get_port, GetPort}, {put_port, PutPort},
-            {get_enabled, GetEnabled}, {put_enabled, PutEnabled}],
+            {get_enabled, GetEnabled}, {put_enabled, PutEnabled},
+            {use_s3, UseS3}, {s3_bucket, S3Bucket}],
     spawn_link(Node, ddfs_node, start_link, [Args, self()]).

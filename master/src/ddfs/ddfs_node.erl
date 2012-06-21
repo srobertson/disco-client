@@ -18,6 +18,7 @@
                 putq :: http_queue:q(),
                 getq :: http_queue:q(),
                 tags :: gb_tree(),
+                node_type :: s3_node | std_node,
                 scanner :: pid()}).
 -type state() :: #state{}.
 
@@ -76,15 +77,20 @@ init(Config) ->
     {get_enabled, GetEnabled} = proplists:lookup(get_enabled, Config),
     {put_enabled, PutEnabled} = proplists:lookup(put_enabled, Config),
 
-    put(use_s3, string:equal(disco:get_setting("DISCO_USE_S3"), "true")),
+    {use_s3, UseS3} = proplists:lookup(use_s3, Config),
+    put(use_s3, UseS3),
 
-    case get(use_s3) of
-        true ->
-            put(s3_bucket, disco:get_setting("DISCO_S3_BUCKET")),
-            disco_aws:set_aws_creds();
-        false ->
-            nothing
-    end,
+    NodeType = case get(use_s3) of
+                   true ->
+                       put(node_type, s3_node),
+                       {s3_bucket, S3Bucket} = proplists:lookup(s3_bucket, Config),
+                       put(s3_bucket, S3Bucket),
+                       disco_aws:set_aws_creds(),
+                       s3_node;
+                   false ->
+                       put(node_type, std_node),
+                       std_node
+               end,
 
     {ok, Vols} = find_vols(DdfsRoot),
     {ok, Tags} = find_tags(DdfsRoot, Vols),
@@ -104,13 +110,21 @@ init(Config) ->
             ok
     end,
 
-    Scanner = spawn_link(fun() -> refresh_tags(DdfsRoot, Vols) end),
-    spawn_link(fun() -> monitor_diskspace(DdfsRoot, Vols) end),
+    Scanner = spawn_link(fun() -> 
+                                 put(node_type, NodeType),
+                                 refresh_tags(DdfsRoot, Vols) 
+                         end),
+
+    spawn_link(fun() -> 
+                       put(node_type, NodeType),
+                       monitor_diskspace(DdfsRoot, Vols) 
+               end),
 
     {ok, #state{nodename = NodeName,
                 root = DdfsRoot,
                 vols = Vols,
                 tags = Tags,
+                node_type = NodeType,
                 putq = http_queue:new(?HTTP_MAX_ACTIVE, ?HTTP_QUEUE_LENGTH),
                 getq = http_queue:new(?HTTP_MAX_ACTIVE, ?HTTP_QUEUE_LENGTH),
                 scanner = Scanner}}.
@@ -159,8 +173,11 @@ handle_call({put_blob, BlobName}, From, S) ->
 handle_call({get_tag_timestamp, TagName}, _From, S) ->
     {reply, do_get_tag_timestamp(TagName, S), S};
 
-handle_call({get_tag_data, TagId, {_Time, VolName}}, From, State) ->
-    spawn(fun() -> do_get_tag_data(TagId, VolName, From, State) end),
+handle_call({get_tag_data, TagId, {_Time, VolName}}, From, State=#state{node_type=NodeType}) ->
+    spawn(fun() -> 
+                  put(node_type, NodeType),
+                  do_get_tag_data(TagId, VolName, From, State) 
+          end),
     {noreply, State};
 
 handle_call({put_tag_data, {Tag, Data}}, _From, S) ->
@@ -231,10 +248,11 @@ do_put_blob(BlobName, {Pid, _Ref} = From,
                    root = Root, vols = Vols} = S) ->
     Reply = fun() ->
                     {_Space, VolName} = choose_vol(Vols),
-                    {ok, Local, Url} = ddfs_util:hashdir(list_to_binary(BlobName),
+                    {ok, Local, Url} = ddfs_util:hashdir(get(node_type),
+                                                         list_to_binary(BlobName),
                                                          NodeName, "blob",
                                                          Root, VolName),
-                    case ddfs_util:ensure_dir(Local) of
+                    case ddfs_util:ensure_dir(get(node_type), Local) of
                         ok ->
                             gen_server:reply(From, {ok, Local, Url});
                         {error, E} ->
@@ -261,13 +279,13 @@ do_get_tag_timestamp(TagName, #state{tags = Tags}) ->
 
 -spec do_get_tag_data(tagid(), volume_name(), {pid(), _}, state()) -> ok.
 do_get_tag_data(TagId, VolName, From, #state{root = Root}) ->
-    {ok, TagDir, _Url} = ddfs_util:hashdir(TagId,
+    {ok, TagDir, _Url} = ddfs_util:hashdir(get(node_type), TagId,
                                            disco:host(node()),
                                            "tag",
                                            Root,
                                            VolName),
     TagPath = filename:join(TagDir, binary_to_list(TagId)),
-    case ddfs_util:read_file(TagPath) of
+    case ddfs_util:read_file(get(node_type), TagPath) of
         {ok, Binary} ->
             gen_server:reply(From, {ok, Binary});
         {error, Reason} ->
@@ -283,16 +301,16 @@ do_put_tag_data(Tag, Data, #state{nodename = NodeName,
                                   vols = Vols,
                                   root = Root}) ->
     {_Space, VolName} = choose_vol(Vols),
-    {ok, Local, _} = ddfs_util:hashdir(Tag,
+    {ok, Local, _} = ddfs_util:hashdir(get(node_type), Tag,
                                        NodeName,
                                        "tag",
                                        Root,
                                        VolName),
-    case ddfs_util:ensure_dir(Local) of
+    case ddfs_util:ensure_dir(get(node_type), Local) of
         ok ->
             Partial = lists:flatten(["!partial.", binary_to_list(Tag)]),
             Filename = filename:join(Local, Partial),
-            case ddfs_util:write_file(Filename, Data) of
+            case ddfs_util:write_file(get(node_type), Filename, Data) of
                 ok ->
                     {ok, VolName};
                 {error, _} = E ->
@@ -308,17 +326,17 @@ do_put_tag_commit(Tag, TagVol, #state{nodename = NodeName,
                                       root = Root,
                                       tags = Tags} = S) ->
     {_, VolName} = lists:keyfind(node(), 1, TagVol),
-    {ok, Local, Url} = ddfs_util:hashdir(Tag,
+    {ok, Local, Url} = ddfs_util:hashdir(get(node_type), Tag,
                                          NodeName,
                                          "tag",
                                          Root,
                                          VolName),
-    {TagName, Time} = ddfs_util:unpack_objname(Tag),
+    {TagName, Time} = ddfs_util:unpack_objname(get(node_type), Tag),
 
     TagL = binary_to_list(Tag),
     Src = filename:join(Local, lists:flatten(["!partial.", TagL])),
     Dst = filename:join(Local,  TagL),
-    case ddfs_util:safe_rename(Src, Dst) of
+    case ddfs_util:safe_rename(get(node_type), Src, Dst) of
         ok ->
             {{ok, Url},
              S#state{tags = gb_trees:enter(TagName, {Time, VolName}, Tags)}};
@@ -329,7 +347,7 @@ do_put_tag_commit(Tag, TagVol, #state{nodename = NodeName,
 
 -spec try_makedir(path()) -> ok | error.
 try_makedir(Dir) ->
-    case ddfs_util:make_dir(Dir) of
+    case ddfs_util:make_dir(get(node_type), Dir) of
         ok ->
             ok;
         {error, eexist} ->
@@ -351,7 +369,7 @@ init_vols(Root, VolNames) ->
 
 -spec find_vols(path()) -> eof | ok | {ok, [volume()]} | {error, _}.
 find_vols(Root) ->
-    case ddfs_util:list_dir(Root) of
+    case ddfs_util:list_dir(get(node_type), Root) of
         {ok, Files} ->
             case [F || "vol" ++ _ = F <- Files] of
                 [] ->
@@ -374,7 +392,7 @@ find_vols(Root) ->
 find_tags(Root, Vols) ->
     {ok,
      lists:foldl(fun({_Space, VolName}, Tags) ->
-                         ddfs_util:fold_files(filename:join([Root, VolName, "tag"]),
+                         ddfs_util:fold_files(get(node_type), filename:join([Root, VolName, "tag"]),
                                               fun(Tag, _, Tags1) ->
                                                       parse_tag(Tag, VolName, Tags1)
                                               end, Tags)
@@ -383,7 +401,7 @@ find_tags(Root, Vols) ->
 -spec parse_tag(nonempty_string(), volume_name(), gb_tree()) -> gb_tree().
 parse_tag("!" ++ _, _, Tags) -> Tags;
 parse_tag(Tag, VolName, Tags) ->
-    {TagName, Time} = ddfs_util:unpack_objname(Tag),
+    {TagName, Time} = ddfs_util:unpack_objname(get(node_type), Tag),
     case gb_trees:lookup(TagName, Tags) of
         none ->
             gb_trees:insert(TagName, {Time, VolName}, Tags);
@@ -405,7 +423,7 @@ choose_vol(Vols) ->
 monitor_diskspace(Root, Vols) ->
     timer:sleep(?DISKSPACE_INTERVAL),
     Fold = fun({_OldSpace, VolName}, VolAcc) ->
-                   case ddfs_util:diskspace(filename:join([Root, VolName])) of
+                   case ddfs_util:diskspace(get(node_type), filename:join([Root, VolName])) of
                        {ok, Space} -> [{Space, VolName} | VolAcc];
                        _ -> VolAcc
                    end

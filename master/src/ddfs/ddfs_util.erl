@@ -310,11 +310,11 @@ write_file(std_node, Filename, Data) ->
 
 -spec make_dir(list()) -> ok.
 make_dir(Dir) ->
-    prim_file:make_dir(std_node, Dir).
+    make_dir(std_node, Dir).
 
 -spec make_dir(s3_node | std_node, list()) -> ok.
 make_dir(s3_node, Dir) ->
-    prim_file:make_dir(std_node, Dir);
+    make_dir(std_node, Dir);
 make_dir(std_node, Dir) ->
     prim_file:make_dir(Dir).
 
