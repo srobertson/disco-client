@@ -1,18 +1,22 @@
 -module(worker_runtime).
 -export([init/2, handle/2, get_pid/1]).
 
+-include("common_types.hrl").
 -include("disco.hrl").
 
 -record(state, {task :: task(),
                 inputs,
                 master :: node(),
                 start_time :: erlang:timestamp(),
-                child_pid :: 'none' | non_neg_integer(),
+                child_pid :: none | non_neg_integer(),
                 persisted_outputs :: [string()],
-                output_filename :: 'none' | string(),
-                output_file :: 'none' | file:io_device()}).
+                output_filename :: none | string(),
+                output_file :: none | file:io_device()}).
 -type state() :: #state{}.
--export_type([state/0]).
+
+-type results() :: {none | binary(), [binary()]}.
+
+-export_type([state/0, results/0]).
 
 -spec init(task(), node()) -> state().
 init(Task, Master) ->
@@ -25,7 +29,7 @@ init(Task, Master) ->
            output_filename = none,
            output_file = none}.
 
--spec get_pid(state()) -> 'none' | non_neg_integer().
+-spec get_pid(state()) -> none | non_neg_integer().
 get_pid(#state{child_pid = Pid}) ->
     Pid.
 
@@ -54,10 +58,10 @@ payload_type(_Type) -> none.
 
 -type worker_msg() :: {nonempty_string(), term()}.
 
--type do_handle() :: {'ok', worker_msg(), state()}
-                   | {'error', {'fatal', term()}, state()}
-                   | {'stop', {'error' | 'fatal' | 'done', term()}}.
--type handle() :: do_handle() | {'error', {'fatal', term()}}.
+-type do_handle() :: {ok, worker_msg(), state()}
+                   | {error, {fatal, term()}, state()}
+                   | {stop, {error | fatal | done, term()}}.
+-type handle() :: do_handle() | {error, {fatal, term()}}.
 
 -spec handle({binary(), binary()}, state()) -> handle().
 handle({Type, Body}, S) ->
@@ -109,7 +113,7 @@ do_handle({<<"TASK">>, _Body}, #state{task = Task} = S) ->
                          {<<"put_port">>, PutPort},
                          {<<"ddfs_data">>, list_to_binary(DDFSData)},
                          {<<"disco_data">>, list_to_binary(DiscoData)},
-                         {<<"mode">>, list_to_binary(Task#task.mode)},
+                         {<<"mode">>, list_to_binary(atom_to_list(Task#task.mode))},
                          {<<"jobfile">>, list_to_binary(JobFile)},
                          {<<"jobname">>, list_to_binary(Task#task.jobname)},
                          {<<"host">>, list_to_binary(disco:host(node()))}]},
@@ -156,10 +160,12 @@ do_handle({<<"OUTPUT">>, Results}, S) ->
 do_handle({<<"PING">>, _Body}, S) ->
     {ok, {"OK", <<"pong">>}, S};
 
-do_handle({<<"DONE">>, _Body}, #state{task = Task, master = Master} = S) ->
+do_handle({<<"DONE">>, _Body}, #state{task = Task,
+                                      master = Master,
+                                      start_time = ST} = S) ->
     case close_output(S) of
         ok ->
-            Time = disco:format_time_since(S#state.start_time),
+            Time = disco:format_time_since(ST),
             Msg = ["Task finished in ", Time],
             disco_worker:event({<<"DONE">>, Msg}, Task, Master),
             {stop, {done, results(S)}};
@@ -171,19 +177,19 @@ do_handle({<<"DONE">>, _Body}, #state{task = Task, master = Master} = S) ->
 input_reply(Inputs) ->
     {"INPUT", [<<"done">>, [[Iid, <<"ok">>, Repl] || {Iid, Repl} <- Inputs]]}.
 
--spec url_path(task(), nonempty_string(), nonempty_string()) -> file:filename().
+-spec url_path(task(), host(), path()) -> file:filename().
 url_path(Task, Host, LocalFile) ->
     LocationPrefix = disco:joburl(Host, Task#task.jobname),
     filename:join(LocationPrefix, LocalFile).
 
--spec local_results(task(), nonempty_string()) -> binary().
+-spec local_results(task(), path()) -> binary().
 local_results(Task, FileName) ->
     Host = disco:host(node()),
     Output = io_lib:format("dir://~s/~s",
                            [Host, url_path(Task, Host, FileName)]),
     list_to_binary(Output).
 
--spec results(state()) -> {'none' | binary(), [string()]}.
+-spec results(state()) -> {none | binary(), [binary()]}.
 results(#state{output_filename = none, persisted_outputs = Outputs}) ->
     {none, Outputs};
 results(#state{task = Task,
@@ -191,11 +197,10 @@ results(#state{task = Task,
                persisted_outputs = Outputs}) ->
     {local_results(Task, FileName), Outputs}.
 
--spec add_output(list(), #state{}) -> {ok, state()} | {error, term()}.
-add_output([Tag, <<"tag">>], S) ->
+-spec add_output(list(), state()) -> {ok, state()} | {error, term()}.
+add_output([Tag, <<"tag">>], #state{persisted_outputs = PO} = S) ->
     Result = list_to_binary(io_lib:format("tag://~s", [Tag])),
-    Outputs = [Result | S#state.persisted_outputs],
-    {ok, S#state{persisted_outputs = Outputs}};
+    {ok, S#state{persisted_outputs = [Result | PO]}};
 
 add_output(RL, #state{task = Task, output_file = none} = S) ->
     ResultsFileName = results_filename(Task),
@@ -218,7 +223,7 @@ add_output(RL, #state{output_file = RF} = S) ->
             {error, ioerror("Writing to index file failed", Reason)}
     end.
 
--spec results_filename(task()) -> nonempty_string().
+-spec results_filename(task()) -> path().
 results_filename(Task) ->
     TimeStamp = timer:now_diff(now(), {0,0,0}),
     FileName = io_lib:format("~s-~B-~B.results", [Task#task.mode,
@@ -237,7 +242,7 @@ format_output_line(#state{task = Task}, [LocalFile, Type, Label]) ->
                                                binary_to_list(LocalFile))]).
 
 
--spec close_output(#state{}) -> 'ok' | {error, term()}.
+-spec close_output(state()) -> ok | {error, term()}.
 close_output(#state{output_file = none}) -> ok;
 close_output(#state{output_file = File}) ->
     case {prim_file:sync(File), prim_file:close(File)} of

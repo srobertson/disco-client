@@ -1,51 +1,100 @@
 -module(event_server).
 -behaviour(gen_server).
 
+-export([new_job/2, end_job/1, clean_job/1,
+         get_jobs/0, get_jobs/1, get_jobinfo/1, get_job_events/3,
+         get_map_results/1, get_results/1,
+         event/4, event/5, event/6,
+         task_event/2, task_event/3, task_event/4, task_event/5]).
+-export([start_link/0, init/1, handle_call/3, handle_cast/2, handle_info/2,
+         terminate/2, code_change/3]).
+
+-include("common_types.hrl").
+-include("gs_util.hrl").
+-include("disco.hrl").
+
 -define(EVENT_PAGE_SIZE, 100).
 -define(EVENT_BUFFER_SIZE, 1000).
 -define(EVENT_BUFFER_TIMEOUT, 2000).
 
--export([new_job/2,
-         end_job/1,
-         event/4,
-         event/5,
-         event/6,
-         task_event/2,
-         task_event/3,
-         task_event/4,
-         task_event/5]).
--export([start_link/0,
-         stop/0,
-         init/1,
-         handle_call/3,
-         handle_cast/2,
-         handle_info/2,
-         terminate/2,
-         code_change/3]).
+-type job_eventinfo() :: {StartTime :: binary(),
+                          JobCoordinator :: pid(),
+                          jobinfo(),
+                          Results :: [job_coordinator:input()],
+                          Ready :: [task_mode()],
+                          Failed :: [task_mode()]}.
 
--include("disco.hrl").
+-export_type([job_eventinfo/0]).
 
--spec new_job(nonempty_string(), pid()) -> {'ok', jobname()}.
+-spec new_job(jobname(), pid()) -> {ok, jobname()}.
 new_job(Prefix, JobCoordinator) ->
     gen_server:call(?MODULE, {new_job, Prefix, JobCoordinator}, 10000).
 
--spec end_job(jobname()) -> 'ok'.
+-spec end_job(jobname()) -> ok.
 end_job(JobName) ->
     gen_server:cast(?MODULE, {job_done, JobName}).
 
+-type joblist_entry() :: {JobName :: binary(),
+                          process_status(),
+                          StartTime :: erlang:timestamp(),
+                          JobCoordinator :: pid()}.
+
+-spec get_jobs() -> {ok, [joblist_entry()]}.
+get_jobs() ->
+    gen_server:call(?MODULE, get_jobs).
+
+-spec get_jobs(Master :: node()) -> {ok, [joblist_entry()]}.
+get_jobs(Master) ->
+    gen_server:call({?MODULE, Master}, get_jobs).
+
+-spec get_jobinfo(jobname()) -> invalid_job | {ok, job_eventinfo()}.
+get_jobinfo(JobName) ->
+    gen_server:call(?MODULE, {get_jobinfo, JobName}).
+
+-spec get_job_events(jobname(), string(), integer()) -> {ok, [binary()]}.
+get_job_events(JobName, Q, N) ->
+    gen_server:call(?MODULE, {get_job_events, JobName, string:to_lower(Q), N}).
+
+-spec get_map_results(jobname()) -> invalid_job | not_ready
+                                        | {ok, [job_coordinator:input()]}.
+get_map_results(JobName) ->
+    gen_server:call(?MODULE, {get_map_results, JobName}).
+
+-spec get_results(jobname()) -> invalid_job | {ready, pid(), [job_coordinator:input()]}
+                                    | {process_status(), pid()}.
+get_results(JobName) ->
+    gen_server:call(?MODULE, {get_results, JobName}).
+
+-spec clean_job(jobname()) -> ok.
+clean_job(JobName) ->
+    gen_server:cast(?MODULE, {clean_job, JobName}).
+
+-spec start_link() -> {ok, pid()}.
 start_link() ->
     lager:info("Event server starts"),
-    case gen_server:start_link({local, event_server}, event_server, [], []) of
+    case gen_server:start_link({local, ?MODULE}, ?MODULE, [], []) of
         {ok, Server} -> {ok, Server};
         {error, {already_started, Server}} -> {ok, Server}
     end.
 
-stop() ->
-    gen_server:call(event_server, stop).
+% state :: {events dict, msgbuf dict}.
+% events dict: jobname -> { [<event>], <start_time>, <job_coordinator_pid> }
+%              event ::= {ready, <results>}
+%                      | {map_ready, <map-results> :: [binary()]}
+%                      | {reduce_ready, <reduce-results> :: [binary()]}
+%                      | {job_data, jobinfo()}
+%                      | {task_ready, map | reduce}
+%                      | {task_failed, map | reduce}
+%
+% msgbuf dict: jobname -> { <nmsgs>, <list-length>, [<msg>] }
+%
 
-init(_Args) ->
-    _ = ets:new(event_files, [named_table]),
-    {ok, {dict:new(), dict:new()}}.
+-type process_status() :: active | dead | ready.
+process_status(Pid) ->
+    case is_process_alive(Pid) of
+        true -> active;
+        false -> dead
+    end.
 
 json_list(List) -> json_list(List, []).
 json_list([], _) -> [];
@@ -54,7 +103,7 @@ json_list([X], L) ->
 json_list([X|R], L) ->
     json_list(R, [<<X/binary, ",">>|L]).
 
--spec unique_key(nonempty_string(), dict()) -> 'invalid_prefix' | {ok, nonempty_string()}.
+-spec unique_key(jobname(), dict()) -> invalid_prefix | {ok, jobname()}.
 unique_key(Prefix, Dict) ->
     C = string:chr(Prefix, $/) + string:chr(Prefix, $.),
     if C > 0 ->
@@ -70,13 +119,22 @@ unique_key(Prefix, Dict) ->
         end
     end.
 
+-type state() :: {dict(), dict()}.
+
+-spec init(_) -> gs_init().
+init(_Args) ->
+    _ = ets:new(event_files, [named_table]),
+    {ok, {dict:new(), dict:new()}}.
+
+-spec handle_call(term(), from(), state()) -> gs_reply(term()) | gs_noreply().
+
 handle_call(get_jobs, _From, {Events, _MsgBuf} = S) ->
     Jobs = dict:fold(fun
-        (Name, {[{ready, _Results}|_], Start, Pid}, Acc) ->
-            [{list_to_binary(Name), ready, Start, Pid}|Acc];
-        (Name, {_Events, Start, Pid}, Acc) ->
-            [{list_to_binary(Name), process_status(Pid), Start, Pid}|Acc]
-    end, [], Events),
+                         (Name, {[{ready, _Results}|_], Start, Pid}, Acc) ->
+                             [{list_to_binary(Name), ready, Start, Pid}|Acc];
+                         (Name, {_Events, Start, Pid}, Acc) ->
+                             [{list_to_binary(Name), process_status(Pid), Start, Pid}|Acc]
+                     end, [], Events),
     {reply, {ok, Jobs}, S};
 
 handle_call({get_job_events, JobName, Query, N0}, _From, {_Events, MsgBuf} = S) ->
@@ -149,6 +207,8 @@ handle_call({get_jobinfo, JobName}, _From, {Events, _MsgBuf} = S) ->
             {reply, {ok, {Start, Pid, JobNfo, Results, Ready, Failed}}, S}
     end.
 
+-spec handle_cast(term(), state()) -> gs_noreply().
+
 handle_cast({add_job_event, Host, JobName, Msg, Params}, {_Events, MsgBuf} = S) ->
     case dict:is_key(JobName, MsgBuf) of
         true  -> {noreply, add_event(Host, JobName, Msg, Params, S)};
@@ -178,6 +238,7 @@ handle_cast({clean_job, JobName}, {Events, _MsgBuf} = S) ->
     delete_jobdir(JobName),
     {noreply, {dict:erase(JobName, Events), MsgBufN}}.
 
+-spec handle_info(term(), state()) -> gs_noreply().
 handle_info(Msg, State) ->
     lager:warning("Unknown message received: ~p", [Msg]),
     {noreply, State}.
@@ -199,12 +260,6 @@ grep_log(JobName, Query, N) ->
                                   event_log(JobName),
                                   " 2>/dev/null | head -n ", integer_to_list(N)]), "\n"),
     [list_to_binary(L) || L <- lists:reverse(Lines)].
-
-process_status(Pid) ->
-    case is_process_alive(Pid) of
-        true -> active;
-        false -> dead
-    end.
 
 event_filter(Key, EventList) ->
     [V || {K, V} <- EventList, K == Key].
@@ -231,7 +286,7 @@ add_event(Host0, JobName, Msg, Params, {Events, MsgBuf}) ->
     end,
     MsgBufN = dict:store(JobName, {NMsg + 1, LstLen, MsgLst}, MsgBuf),
     if
-        Params == [] ->
+        Params =:= []; Params =:= {} ->
             {Events, MsgBufN};
         true ->
             {ok, {EvLst0, Nu, Pid}} = dict:find(JobName, Events),
@@ -239,15 +294,15 @@ add_event(Host0, JobName, Msg, Params, {Events, MsgBuf}) ->
              MsgBufN}
     end.
 
-%-spec event(jobname(), nonempty_string(), [_], [_]) -> _.
+-spec event(jobname(), nonempty_string(), list(), tuple()) -> ok.
 event(JobName, Format, Args, Params) ->
     event("master", JobName, Format, Args, Params).
 
-%-spec event(nonempty_string(), jobname(), nonempty_string(), [_], [_]) -> _.
+-spec event(host(), jobname(), nonempty_string(), list(), tuple()) -> ok.
 event(Host, JobName, Format, Args, Params) ->
-    event(event_server, Host, JobName, Format, Args, Params).
+    event(?MODULE, Host, JobName, Format, Args, Params).
 
-%-spec event(atom(), nonempty_string(), jobname(), nonempty_string(), [_], [_]) -> _.
+-spec event(server(), host(), jobname(), nonempty_string(), list(), tuple()) -> ok.
 event(EventServer, Host, JobName, Format, Args, Params) ->
     SArgs = [case lists:flatlength(io_lib:fwrite("~p", [X])) > 1000000 of
                  true -> trunc_io:fprint(X, 1000000);
@@ -265,15 +320,19 @@ event(EventServer, Host, JobName, Format, Args, Params) ->
     Msg = list_to_binary(Json),
     gen_server:cast(EventServer, {add_job_event, Host, JobName, Msg, Params}).
 
+-spec task_event(task(), term()) -> ok.
 task_event(Task, Event) ->
     task_event(Task, Event, {}).
 
+-spec task_event(task(), term(), tuple()) -> ok.
 task_event(Task, Event, Params) ->
     task_event(Task, Event, Params, "master").
 
+-spec task_event(task(), term(), tuple(), host()) -> ok.
 task_event(Task, Event, Params, Host) ->
-    task_event(Task, Event, Params, Host, event_server).
+    task_event(Task, Event, Params, Host, ?MODULE).
 
+-spec task_event(task(), term(), tuple(), host(), server()) -> ok.
 task_event(Task, {Type, Message}, Params, Host, EventServer) ->
     event(EventServer,
           Host,
@@ -290,8 +349,10 @@ task_format(_Msg) ->
     "~w".
 
 % callback stubs
-terminate(_Reason, _State) -> {}.
+-spec terminate(term(), state()) -> ok.
+terminate(_Reason, _State) -> ok.
 
+-spec code_change(term(), state(), term()) -> {ok, state()}.
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 delete_jobdir(JobName) ->
@@ -306,7 +367,7 @@ delete_jobdir(JobName) ->
 job_event_handler(JobName, JobCoordinator) ->
     {ok, _JobHome} = disco:make_dir(disco:jobhome(JobName)),
     {ok, File} = file:open(event_log(JobName), [append, raw]),
-    gen_server:call(event_server, {job_initialized, JobName, self()}),
+    gen_server:call(?MODULE, {job_initialized, JobName, self()}),
     gen_server:reply(JobCoordinator, {ok, JobName}),
     {ok, _} = timer:send_after(?EVENT_BUFFER_TIMEOUT, flush),
     job_event_handler_do(File, [], 0).

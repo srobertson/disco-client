@@ -1,9 +1,11 @@
 -module(disco_web).
 -export([op/3]).
 
+-include("common_types.hrl").
 -include("disco.hrl").
 -include("config.hrl").
 
+-spec op(atom(), string(), module()) -> _.
 op('GET', "/disco/version", Req) ->
     {ok, Vsn} = application:get_key(vsn),
     reply({ok, list_to_binary(Vsn)}, Req);
@@ -11,17 +13,19 @@ op('GET', "/disco/version", Req) ->
 op('POST', "/disco/job/" ++ _, Req) ->
     BodySize = list_to_integer(Req:get_header_value("content-length")),
     if BodySize > ?MAX_JOB_PACKET ->
-        Req:respond({413, [], ["Job packet too large"]});
+            Req:respond({413, [], ["Job packet too large"]});
     true ->
-        Body = Req:recv_body(?MAX_JOB_PACKET),
-        case catch job_coordinator:new(Body) of
-            {ok, JobName} ->
-                reply({ok, [<<"ok">>, list_to_binary(JobName)]}, Req);
-            Error ->
-                ErrorString = disco:format("Job failed to start: ~p", [Error]),
-                lager:warning("Job failed to start: ~p", [Error]),
-                reply({ok, [<<"error">>, list_to_binary(ErrorString)]}, Req)
-        end
+            Body = Req:recv_body(?MAX_JOB_PACKET),
+            Reply =
+                try
+                    {ok, JobName} = job_coordinator:new(Body),
+                    [<<"ok">>, list_to_binary(JobName)]
+                catch K:E ->
+                        ErrorString = disco:format("Job failed to start: ~p:~p", [K, E]),
+                        lager:warning("Job failed to start: ~p:~p", [K, E]),
+                        [<<"error">>, list_to_binary(ErrorString)]
+                end,
+            reply({ok, Reply}, Req)
     end;
 
 op('POST', "/disco/ctrl/" ++ Op, Req) ->
@@ -38,7 +42,8 @@ op('GET', "/disco/ctrl/" ++ Op, Req) ->
     reply(getop(Op, {Query, Name}), Req);
 
 op('GET', Path, Req) ->
-    ddfs_get:serve_disco_file(Path, Req);
+    DiscoRoot = disco:get_setting("DISCO_DATA"),
+    ddfs_get:serve_disco_file(DiscoRoot, Path, Req);
 
 op(_, _, Req) ->
     Req:not_found().
@@ -58,14 +63,14 @@ getop("load_config_table", _Query) ->
     disco_config:get_config_table();
 
 getop("joblist", _Query) ->
-    {ok, Jobs} = gen_server:call(event_server, get_jobs),
+    {ok, Jobs} = event_server:get_jobs(),
     {ok, [[1000000 * MSec + Sec, list_to_binary(atom_to_list(Status)), Name]
           || {Name, Status, {MSec, Sec, _USec}, _Pid}
                  <- lists:reverse(lists:keysort(3, Jobs))]};
 
 getop("jobinfo", {_Query, JobName}) ->
     {ok, Active} = disco_server:get_active(JobName),
-    case gen_server:call(event_server, {get_jobinfo, JobName}) of
+    case event_server:get_jobinfo(JobName) of
         {ok, JobInfo} ->
             HostInfo = lists:unzip([{Host, M}
                                     || {Host, #task{mode = M}} <- Active]),
@@ -87,8 +92,7 @@ getop("jobevents", {Query, Name}) ->
             false -> "";
             {_, F} -> string:to_lower(F)
         end,
-    {ok, Ev} = gen_server:call(event_server,
-                               {get_job_events, Name, string:to_lower(Q), Num}),
+    {ok, Ev} = event_server:get_job_events(Name, string:to_lower(Q), Num),
     {raw, Ev};
 
 getop("nodeinfo", _Query) ->
@@ -142,7 +146,7 @@ getop("get_settings", _Query) ->
                                  end, L))}};
 
 getop("get_mapresults", {_Query, Name}) ->
-    case gen_server:call(event_server, {get_map_results, Name}) of
+    case event_server:get_map_results(Name) of
         {ok, _Res} = OK ->
             OK;
         _ ->
@@ -186,7 +190,7 @@ postop("clean_job", Json) ->
                      end);
 
 postop("get_results", Json) ->
-    Results = fun(N) -> gen_server:call(event_server, {get_results, N}) end,
+    Results = fun(N) -> event_server:get_results(N) end,
     validate_payload("get_results", {array, [integer, {hom_array, string}]}, Json,
                      fun(J) ->
                              [Timeout, Names] = J,
@@ -257,15 +261,15 @@ update_setting(Key, Val, _) ->
     lager:info("Unknown setting: ~p = ~p", [Key, Val]).
 
 count_maps(L) ->
-    {M, N} = lists:foldl(fun ("map", {M, N}) ->
+    {M, N} = lists:foldl(fun (map, {M, N}) ->
                                  {M + 1, N + 1};
-                             (["map"], {M, N}) ->
-                                 {M + 1, N + 1};
-                             (_, {M, N}) ->
+                             (reduce, {M, N}) ->
                                  {M, N + 1}
                          end, {0, 0}, L),
     {M, N - M}.
 
+-spec render_jobinfo(event_server:job_eventinfo(), {[host()], [task_mode()]})
+                    -> term().
 render_jobinfo({Timestamp, Pid, JobInfo, Results, Ready, Failed},
                {Hosts, Modes}) ->
     {NMapRun, NRedRun} = count_maps(Modes),
@@ -317,7 +321,5 @@ wait_jobs(Jobs, Timeout) ->
             receive {'DOWN', _, _, _, _} -> ok
             after Timeout -> ok
             end,
-            [{N, gen_server:call(event_server,
-                                 {get_results, binary_to_list(N)})}
-             || {N, _} <- Jobs]
+            [{N, event_server:get_results(binary_to_list(N))} || {N, _} <- Jobs]
     end.

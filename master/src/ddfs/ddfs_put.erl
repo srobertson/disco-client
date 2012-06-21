@@ -3,24 +3,32 @@
 
 -include_lib("kernel/include/file.hrl").
 
+-include("common_types.hrl").
 -include("config.hrl").
+-include("ddfs.hrl").
 
 -export([start/1]).
 
 % maximum file size: 1T
 -define(MAX_RECV_BODY, (1024*1024*1024*1024)).
 
-start(MochiConfig) ->
-    error_logger:info_msg("Starting ~p on ~p", [?MODULE, node()]),
-    mochiweb_http:start([
-        {name, ddfs_put},
-        {max, ?HTTP_MAX_CONNS},
-        {loop, fun(Req) ->
-                    loop(Req:get(path), Req)
-                end}
-        | MochiConfig]).
+-spec start(non_neg_integer()) -> {ok, pid()} | {error, term()}.
+start(Port) ->
+    Ret = mochiweb_http:start([{name, ddfs_put},
+                               {max, ?HTTP_MAX_CONNS},
+                               {loop, fun(Req) ->
+                                              loop(Req:get(path), Req)
+                                      end},
+                               {port, Port}]),
+    case Ret of
+        {ok, _Pid} -> error_logger:info_msg("Started ~p at ~p on port ~p",
+                                            [?MODULE, node(), Port]);
+        E ->          error_logger:error_msg("~p failed at ~p on port ~p: ~p",
+                                             [?MODULE, node(), Port, E])
+    end,
+    Ret.
 
--spec loop(nonempty_string(), module()) -> _.
+-spec loop(path(), module()) -> _.
 loop("/proxy/" ++ Path, Req) ->
     {_Node, Rest} = mochiweb_util:path_split(Path),
     {_Method, RealPath} = mochiweb_util:path_split(Rest),
@@ -57,8 +65,7 @@ valid_blob({'EXIT', _}) -> false;
 valid_blob({Name, _}) ->
     ddfs_util:is_valid_name(binary_to_list(Name)).
 
--spec receive_blob(module(), {nonempty_string(), nonempty_string()},
-    nonempty_string()) -> _.
+-spec receive_blob(module(), {path(), path()}, path()) -> _.
 receive_blob(Req, {Path, Fname}, Url) ->
     Dir = filename:join(Path, Fname),
     case prim_file:read_file_info(Dir) of
@@ -74,8 +81,7 @@ receive_blob(Req, {Path, Fname}, Url) ->
             error_reply(Req, "File exists", Dir, Dir)
     end.
 
--spec receive_blob(module(), file:io_device(), nonempty_string(),
-    nonempty_string()) -> _.
+-spec receive_blob(module(), file:io_device(), file:filename(), path()) -> _.
 receive_blob(Req, IO, Dst, Url) ->
     error_logger:info_msg("PUT BLOB: ~p (~p bytes) on ~p",
                           [Req:get(path), Req:get_header_value("content-length"), node()]),

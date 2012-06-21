@@ -190,6 +190,7 @@
 -include("ddfs.hrl").
 -include("ddfs_tag.hrl").
 -include("ddfs_gc.hrl").
+-include("gs_util.hrl").
 
 -define(NODE_RETRY_WAIT, 30000).
 
@@ -256,7 +257,7 @@ add_replicas(Master, BlobName, NewUrls) ->
 
 %% ===================================================================
 %% gen_server callbacks
-
+-spec init({string(), ets:tab()}) -> gs_init().
 init({Root, DeletedAges}) ->
     % Ensure only one gc process is running at a time.  We don't use a
     % named process to implement uniqueness so that our message queue
@@ -292,7 +293,10 @@ init({Root, DeletedAges}) ->
     gen_server:cast(self(), start),
     {ok, State}.
 
-
+-type is_orphan_msg() :: {is_orphan, object_type(), object_name(),
+                          node(), volume_name()}.
+-spec handle_call(is_orphan_msg(), from(), state()) -> gs_reply(boolean());
+                 (dbg_state_msg(), from(), state()) -> gs_reply(state()).
 handle_call({is_orphan, Type, ObjName, Node, Vol}, _, S) ->
     S1 = S#state{last_response_time = now()},
     {reply, check_is_orphan(S, Type, ObjName, Node, Vol), S1};
@@ -300,6 +304,18 @@ handle_call({is_orphan, Type, ObjName, Node, Vol}, _, S) ->
 handle_call(dbg_get_state, _, S) ->
     {reply, S, S}.
 
+-type gc_status_msg()     :: {gc_status, pid()}.
+-type retry_node_msg()    :: {retry_node, node()}.
+-type build_map_msg()     ::  {build_map, [tagname()]}.
+-type gc_done_msg()       :: {gc_done, node(), gc_run_stats()}.
+-type rr_blob_msg()       :: {rr_blob, term()}.
+-type add_replicas_msg()  :: {add_replicas, object_name(), [url()]}.
+-type rr_tags_msg()       :: {rr_tags, [tagname()]}.
+
+-spec handle_cast(gc_status_msg() | retry_node_msg() | build_map_msg()
+                  | gc_done_msg() | rr_blob_msg()    | add_replicas_msg()
+                  | rr_tags_msg(),
+                  state()) -> gs_noreply() | gs_stop(stop_requested | shutdown).
 handle_cast({gc_status, From}, #state{phase = P} = S) when is_pid(From) ->
     From ! {ok, P},
     {noreply, S};
@@ -460,6 +476,12 @@ handle_cast({rr_tags, []}, #state{phase = rr_tags, gc_peers = Peers,
     cleanup_for_exit(S),
     {stop, shutdown, S}.
 
+-type check_blob_result_msg() :: {check_blob_result, local_object(),
+                                  check_blob_result()}.
+-spec handle_info(check_blob_result_msg() | check_progress
+                  | {'EXIT', pid(), term()} | {reference(), term()},
+                  state()) -> gs_noreply() | gs_stop(shutdown).
+
 handle_info({check_blob_result, LocalObj, Status},
             #state{phase = Phase, num_pending_reqs = NumPendingReqs} = S)
   when Phase =:= build_map;
@@ -490,7 +512,7 @@ handle_info(check_progress, #state{phase = Phase, last_response_time = LRT} = S)
             {noreply, S#state{progress_timer = T}};
         false ->
             % We haven't made progress. Stop GC.
-            lager:error("GC: progress timeout in ~p", [S#state.phase]),
+            lager:error("GC: progress timeout in ~p", [Phase]),
             cleanup_for_exit(S),
             {stop, shutdown, S}
     end;
@@ -544,11 +566,14 @@ handle_info({Ref, _Msg}, S) when is_reference(Ref) ->
 %% ===================================================================
 %% gen_server callback stubs
 
+-spec terminate(term(), state()) -> ok.
 terminate(_Reason, _S) -> ok.
 
+-spec code_change(term(), state(), term()) -> {ok, state()}.
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
+-spec format_status(term(), [term()]) -> [term()].
 format_status(_Opt, [_PDict, S]) ->
     [{data, [{"State", [{phase, S#state.phase}]}]}].
 
@@ -706,8 +731,8 @@ ddfs_url(Url) ->
 -spec check_blob_status(state(), {'ignore', 'unknown'} | local_object())
                        -> non_neg_integer().
 check_blob_status(_S, {ignore, _}) -> 0;
-check_blob_status(S, {ObjName, Node} = Key) ->
-    case {find_peer(S#state.gc_peers, Node), ets:lookup(gc_blob_map, Key)} of
+check_blob_status(#state{gc_peers = Peers}, {ObjName, Node} = Key) ->
+    case {find_peer(Peers, Node), ets:lookup(gc_blob_map, Key)} of
         {_, [{_, _}]} ->    % Previously seen object
             0;
         {undefined, []} ->  % Unknown node, new object
@@ -739,7 +764,7 @@ check_blob_result(LocalObj, Status) ->
 %% gc phase and replica recovery
 
 -spec start_gc_phase(state()) -> state().
-start_gc_phase(S) ->
+start_gc_phase(#state{gc_peers = Peers} = S) ->
     % We are done with building the in-use map.  Now, we need to
     % collect the nodes that host a replica of each known in-use blob,
     % and also add the nodes that host any recovered replicas.  We
@@ -781,10 +806,10 @@ start_gc_phase(S) ->
     ets:delete(gc_blob_map),
 
     lager:info("GC: entering gc phase"),
-    node_broadcast(S#state.gc_peers, start_gc),
+    node_broadcast(Peers, start_gc),
     % Update the last_response_time to indicate forward progress.
     S#state{num_pending_reqs  = 0,
-            pending_nodes = gb_sets:from_list(gb_trees:keys(S#state.gc_peers)),
+            pending_nodes = gb_sets:from_list(gb_trees:keys(Peers)),
             phase = gc,
             last_response_time = now()}.
 
@@ -805,8 +830,9 @@ check_is_orphan(_S, tag, Tag, _Node, _Vol) ->
             % This is a current or newer incarnation.
             {ok, false}
     end;
-check_is_orphan(S, blob, BlobName, Node, Vol) ->
-    MaxReps = S#state.blobk + ?NUM_EXTRA_REPLICAS,
+check_is_orphan(#state{blobk = BlobK, blacklist = BlackList},
+                blob, BlobName, Node, Vol) ->
+    MaxReps = BlobK + ?NUM_EXTRA_REPLICAS,
     % The gc mark/in-use protocol is resumable, but the node loses its
     % in-use knowledge when it goes down.  On reconnect, it might
     % perform orphan-checks on blobs that were already marked by the
@@ -831,7 +857,7 @@ check_is_orphan(S, blob, BlobName, Node, Vol) ->
                 % Use a fast path for the normal case when there is no
                 % blacklist.
                 {false, false}
-                  when S#state.blacklist =:= [],
+                  when BlackList =:= [],
                        length(Present) + length(Recovered) > MaxReps ->
                     % This is a newly recovered replica, but we have
                     % more than enough replicas, so we can afford
@@ -840,7 +866,7 @@ check_is_orphan(S, blob, BlobName, Node, Vol) ->
                                [BlobName, Node, Vol]),
                     {ok, true};
                 {false, false}
-                  when S#state.blacklist =:= [] ->
+                  when BlackList =:= [] ->
                     % This is a usable, newly-recovered, lost replica;
                     % record the volume for later use.
                     lager:info("GC: recovering replica of ~p from ~p/~p",
@@ -850,8 +876,7 @@ check_is_orphan(S, blob, BlobName, Node, Vol) ->
                     {ok, false};
                 {false, false} ->
                     {RepNodes, _RepVols} = lists:unzip(Recovered),
-                    Blacklist = S#state.blacklist,
-                    Usable = find_usable(Blacklist, lists:usort(RepNodes ++ PresentNodes)),
+                    Usable = find_usable(BlackList, lists:usort(RepNodes ++ PresentNodes)),
                     case length(Usable) > MaxReps of
                         true ->
                             {ok, true};
@@ -982,8 +1007,8 @@ rereplicate_blob(S, BlobName) ->
 -spec rereplicate_blob(state(), object_name(), [object_location()],
                        [object_location()], non_neg_integer())
                       -> rep_result().
-rereplicate_blob(S, BlobName, Present, Recovered, Blobk) ->
-    BL = S#state.blacklist,
+rereplicate_blob(#state{blacklist = BL} = S,
+                 BlobName, Present, Recovered, Blobk) ->
     PresentNodes = [N || {N, _V} <- Present],
     SafePresent = find_usable(BL, PresentNodes),
     SafeRecovered = [{N, V} || {N, V} <- Recovered, not lists:member(N, BL)],
@@ -1040,7 +1065,8 @@ try_put_blob(#state{rr_pid = RR, gc_peers = Peers}, BlobName, OkNodes, BL) ->
         {ok, [PutUrl]} ->
             Srcs = [{find_peer(Peers, N), N} || N <- OkNodes],
             {SrcPeer, SrcNode} = ddfs_util:choose_random(Srcs),
-            RR ! {put_blob, BlobName, SrcPeer, SrcNode, PutUrl},
+            RealPutUrl = ddfs_util:cluster_url(PutUrl, put),
+            RR ! {put_blob, BlobName, SrcPeer, SrcNode, RealPutUrl},
             pending;
         E ->
             {error, E}
@@ -1155,26 +1181,27 @@ log_blacklist_change(Tag, Old, New) ->
 
 -spec update_tag_body(state(), tagname(), tagid(), [[url()]], [node()])
                      -> state().
-update_tag_body(S, Tag, Id, TagUrls, TagReplicas) ->
+update_tag_body(#state{safe_blacklist = SBL, blacklist = BL, tagk = TagK} = S,
+                Tag, Id, TagUrls, TagReplicas) ->
     % Collect the blobs that need updating, and compute their new
     % replica locations.
-    {Updates, SBL1} = collect_updates(S, TagUrls, S#state.safe_blacklist),
-    UsableTagReplicas = find_usable(S#state.blacklist, TagReplicas),
+    {Updates, SBL1} = collect_updates(S, TagUrls, SBL),
+    UsableTagReplicas = find_usable(BL, TagReplicas),
     case {Updates, length(UsableTagReplicas)} of
-        {[], NumTagReps} when NumTagReps >= S#state.tagk ->
+        {[], NumTagReps} when NumTagReps >= TagK ->
             % There are no blob updates, and there are the requisite
             % number of tag replicas; tag doesn't need update.
-            log_blacklist_change(Tag, S#state.safe_blacklist, SBL1),
+            log_blacklist_change(Tag, SBL, SBL1),
             S#state{safe_blacklist = SBL1};
         _ ->
             % In all other cases, send the tag an update, and update
             % the safe_blacklist.
             SBL2 = gb_sets:subtract(SBL1, gb_sets:from_list(TagReplicas)),
-            Msg = {gc_rr_update, Updates, S#state.blacklist, Id},
+            Msg = {gc_rr_update, Updates, BL, Id},
             lager:info("Updating tag ~p with ~p (blacklist ~p)",
-                       [Id, Updates, S#state.blacklist]),
+                       [Id, Updates, BL]),
             ddfs_master:tag_notify(Msg, Tag),
-            log_blacklist_change(Tag, S#state.safe_blacklist, SBL2),
+            log_blacklist_change(Tag, SBL, SBL2),
             S#state{safe_blacklist = SBL2}
     end.
 
@@ -1185,7 +1212,8 @@ collect(_S, [], {_Updates, _SBL} = Result) ->
     Result;
 collect(S, [[]|Rest], {_Updates, _SBL} = Acc) ->
     collect(S, Rest, Acc);
-collect(S, [BlobSet|Rest], {Updates, SBL} = Acc) ->
+collect(#state{blacklist = BL, blobk = BlobK} = S,
+        [BlobSet|Rest], {Updates, SBL} = Acc) ->
     {[BlobName|_], Nodes} = lists:unzip([ddfs_url(Url) || Url <- BlobSet]),
     case BlobName of
         ignore ->
@@ -1195,9 +1223,9 @@ collect(S, [BlobSet|Rest], {Updates, SBL} = Acc) ->
             NewSBL = gb_sets:subtract(SBL, gb_sets:from_list(Nodes)),
 
             NewLocations = usable_locations(S, BlobName) -- BlobSet,
-            BListed = find_unusable(S#state.blacklist, Nodes),
-            Usable  = find_usable(S#state.blacklist, Nodes),
-            CanFilter = [] =/= BListed andalso length(Usable) >= S#state.blobk,
+            BListed = find_unusable(BL, Nodes),
+            Usable  = find_usable(BL, Nodes),
+            CanFilter = [] =/= BListed andalso length(Usable) >= BlobK,
             case {NewLocations, CanFilter} of
                 {[], false} ->
                     % Blacklist filtering is not needed, and there are

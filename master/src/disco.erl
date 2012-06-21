@@ -5,9 +5,7 @@
          settings/0,
          host/1,
          name/1,
-         master_name/0,
-         master_node/1,
-         slave_name/0,
+         slave_name/1,
          slave_node/1,
          slave_safe/1,
          oob_name/1,
@@ -17,7 +15,9 @@
          joburl/2,
          data_root/1,
          data_path/2,
+         ddfs_root/2,
          debug_flags/1,
+         local_cluster/0,
          disco_url_path/1,
          enum/1,
          format/2,
@@ -30,6 +30,9 @@
          is_dir/1]).
 
 -include_lib("kernel/include/file.hrl").
+
+-include("common_types.hrl").
+-include("disco.hrl").
 
 -define(MILLISECOND, 1000).
 -define(SECOND, (1000 * ?MILLISECOND)).
@@ -59,40 +62,56 @@ settings() ->
     [T || T <- string:tokens(get_setting("DISCO_SETTINGS"), ","),
 	  has_setting(T)].
 
--spec host(node()) -> string().
-host(Node) ->
-    string:sub_word(atom_to_list(Node), 2, $@).
-
--spec name(node()) -> string().
+-spec name(node()) -> host().
 name(Node) ->
     string:sub_word(atom_to_list(Node), 1, $@).
 
--spec master_name() -> nonempty_string().
-master_name() ->
-    get_setting("DISCO_NAME") ++ "_master".
-
--spec master_node(string()) -> atom().
-master_node(Host) ->
-    list_to_atom(master_name() ++ "@" ++ Host).
-
--spec slave_name() -> nonempty_string().
-slave_name() ->
+default_slave_name() ->
     get_setting("DISCO_NAME") ++ "_slave".
 
--spec slave_node(string()) -> node().
-slave_node(Host) ->
-    list_to_atom(slave_name() ++ "@" ++ Host).
+-define(DLMTR_STR, "_at_").
 
--spec slave_safe(string()) -> 'false' | node().
-slave_safe(Host) ->
-    case catch list_to_existing_atom(slave_name() ++ "@" ++ Host) of
-        {'EXIT', _Reason} ->
-            false;
-        Node ->
-            Node
+box_slave_name(Host) ->
+    default_slave_name() ++ ?DLMTR_STR ++ Host.
+
+-spec slave_name(host()) -> nonempty_string().
+slave_name(Host) ->
+    case local_cluster() of
+        false -> default_slave_name();
+        true  -> box_slave_name(Host)
     end.
 
--spec oob_name(nonempty_string()) -> nonempty_string().
+-spec slave_node(host()) -> node().
+slave_node(Host) ->
+    case local_cluster() of
+        false -> list_to_atom(default_slave_name() ++ "@" ++ Host);
+        true ->  list_to_atom(box_slave_name(Host) ++ "@localhost")
+    end.
+
+-spec slave_safe(host()) -> false | node().
+slave_safe(Host) ->
+    try
+        case local_cluster() of
+            false -> list_to_existing_atom(default_slave_name() ++ "@" ++ Host);
+            true  -> list_to_existing_atom(box_slave_name(Host) ++ "@localhost")
+        end
+    catch _:_ -> false
+    end.
+
+-spec host(node()) -> host().
+host(Node) ->
+    case local_cluster() of
+        false ->
+            string:sub_word(atom_to_list(Node), 2, $@);
+        true  ->
+            Prefix = string:sub_word(atom_to_list(Node), 1, $@),
+            Regex = default_slave_name() ++ ?DLMTR_STR ++ "(.*)",
+            Capture = [{capture, all_but_first, list}],
+            {match, [Host]} = re:run(Prefix, Regex, Capture),
+            Host
+    end.
+
+-spec oob_name(jobname()) -> nonempty_string().
 oob_name(JobName) ->
     lists:flatten(["disco:job:oob:", JobName]).
 
@@ -103,28 +122,34 @@ hexhash(Path) ->
     <<Hash:8, _/binary>> = erlang:md5(Path),
     lists:flatten(io_lib:format("~2.16.0b", [Hash])).
 
--spec jobhome(nonempty_string()) -> nonempty_string().
+-spec jobhome(jobname()) -> path().
 jobhome(JobName) ->
     jobhome(JobName, get_setting("DISCO_MASTER_ROOT")).
 
--spec jobhome(nonempty_string(), nonempty_string()) -> nonempty_string().
+-spec jobhome(jobname(), path()) -> path().
 jobhome(JobName, Root) ->
     filename:join([Root, hexhash(JobName), JobName]).
 
--spec joburl(nonempty_string(), nonempty_string()) -> nonempty_string().
+-spec joburl(host(), jobname()) -> path().
 joburl(Host, JobName) ->
     filename:join(["disco", Host, hexhash(JobName), JobName]).
 
--spec data_root(node() | nonempty_string()) -> nonempty_string().
+-spec data_root(node() | nonempty_string()) -> path().
 data_root(Node) when is_atom(Node) ->
     data_root(host(Node));
 data_root(Host) ->
     filename:join(get_setting("DISCO_DATA"), Host).
 
--spec data_path(node() | nonempty_string(), nonempty_string()) ->
-                       nonempty_string().
+-spec data_path(node() | host(), path()) -> path().
 data_path(NodeOrHost, Path) ->
     filename:join(data_root(NodeOrHost), Path).
+
+-spec ddfs_root(path(), host()) -> path().
+ddfs_root(DdfsRoot, Host) ->
+    case local_cluster() of
+        false -> DdfsRoot;
+        true  -> filename:join(DdfsRoot, Host)
+    end.
 
 -spec debug_flags(nonempty_string()) -> [term()].
 debug_flags(Server) ->
@@ -136,7 +161,14 @@ debug_flags(Server) ->
         _ -> []
     end.
 
--spec disco_url_path(file:filename()) -> [nonempty_string()].
+-spec local_cluster() -> boolean().
+local_cluster() ->
+    case os:getenv("DISCO_LOCAL_CLUSTER") of
+        false -> false;
+        _ -> true
+    end.
+
+-spec disco_url_path(file:filename()) -> [path()].
 disco_url_path(Url) ->
     {match, [Path]} = re:run(Url,
                              ".*?://.*?/disco/(.*)",
@@ -167,7 +199,7 @@ format_time(Ms, Second, Minute, Hour) ->
 format_time_since(Time) ->
     format_time(timer:now_diff(now(), Time)).
 
--spec make_dir(file:filename()) -> {'ok', file:filename()} | {'error', _}.
+-spec make_dir(file:filename()) -> {ok, file:filename()} | {error, _}.
 make_dir(Dir) ->
     case ensure_dir(Dir) of
         ok ->
@@ -185,7 +217,7 @@ make_dir(Dir) ->
 
 % based on ensure_dir() in /usr/lib/erlang/lib/stdlib-1.17/src/filelib.erl
 
--spec ensure_dir(file:filename()) -> 'ok' | {'error', file:posix()}.
+-spec ensure_dir(file:filename()) -> ok | {error, file:posix()}.
 ensure_dir("/") ->
     ok;
 ensure_dir(F) ->

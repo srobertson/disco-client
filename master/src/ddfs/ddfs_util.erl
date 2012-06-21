@@ -1,26 +1,42 @@
 -module(ddfs_util).
--export([choose_random/1,
+-export([read_file/1,
+         write_file/2,
+         make_dir/1,
+         list_dir/1,
+         read_file/2,
+         write_file/3,
+         make_dir/2,
+         list_dir/2,
+         choose_random/1,
          choose_random/2,
          concatenate/2,
          diskspace/1,
          ensure_dir/1,
          fold_files/3,
+         diskspace/2,
+         ensure_dir/2,
+         fold_files/4,
          format_timestamp/0,
          hashdir/5,
+         hashdir/6,
          is_valid_name/1,
          pack_objname/2,
          parse_url/1,
+         cluster_url/2,
          safe_rename/2,
+         safe_rename/3,
          startswith/2,
          timestamp/0,
          timestamp/1,
          timestamp_to_time/1,
          to_hex/1,
          unpack_objname/1,
+         unpack_objname/2,
          url_to_name/1]).
 
 -include_lib("kernel/include/file.hrl").
 
+-include("common_types.hrl").
 -include("config.hrl").
 -include("ddfs.hrl").
 -include("ddfs_tag.hrl").
@@ -56,9 +72,15 @@ pack_objname(Name, T) ->
     list_to_binary([Name, "$", timestamp(T)]).
 
 -spec unpack_objname(tagid() | string()) -> {binary(), erlang:timestamp()}.
-unpack_objname(Obj) when is_binary(Obj) ->
-    unpack_objname(binary_to_list(Obj));
 unpack_objname(Obj) ->
+    unpack_objname(std_node, Obj).
+
+-spec unpack_objname(s3_node | std_node, tagid() | string()) -> {binary(), erlang:timestamp()}.
+unpack_objname(s3_node, Obj) ->
+    unpack_objname(std_node, Obj);
+unpack_objname(std_node, Obj) when is_binary(Obj) ->
+    unpack_objname(std_node, binary_to_list(Obj));
+unpack_objname(std_node, Obj) ->
     [Name, Tstamp] = string:tokens(Obj, "$"),
     {list_to_binary(Name), timestamp_to_time(Tstamp)}.
 
@@ -75,6 +97,12 @@ url_to_name(Url) ->
 
 -spec ensure_dir(string()) -> 'eof' | 'ok' | {'error', _} | {'ok', _}.
 ensure_dir(Dir) ->
+    ensure_dir(std_node, Dir).
+
+-spec ensure_dir(s3_node | std_node, string()) -> 'eof' | 'ok' | {'error', _} | {'ok', _}.
+ensure_dir(s3_node, Dir) ->
+    ensure_dir(std_node, Dir);
+ensure_dir(std_node, Dir) ->
     case prim_file:make_dir(Dir) of
         ok -> ok;
         {error, eexist} -> ok;
@@ -109,6 +137,13 @@ to_hex(Int, L) ->
 -spec hashdir(binary(), nonempty_string(), nonempty_string(),
     nonempty_string(), nonempty_string()) -> {'ok', string(), binary()}.
 hashdir(Name, Host, Type, Root, Vol) ->
+    hashdir(std_node, Name, Host, Type, Root, Vol).
+
+-spec hashdir(s3_node | std_node, binary(), nonempty_string(), nonempty_string(),
+              nonempty_string(), nonempty_string()) -> {'ok', string(), binary()}.
+hashdir(s3_node, Name, Host, Type, Root, Vol) ->
+    hashdir(std_node, Name, Host, Type, Root, Vol);
+hashdir(std_node, Name, Host, Type, Root, Vol) ->
     <<D0:8, _/binary>> = erlang:md5(Name),
     D1 = to_hex(D0),
     Dir = lists:flatten([case D1 of [_] -> "0"; _ -> "" end, D1]),
@@ -131,9 +166,36 @@ parse_url(Url) when is_list(Url) ->
         _ -> not_ddfs
     end.
 
+-type method() :: get | put.
+-spec cluster_url(binary() | string(), method()) -> string().
+cluster_url(Url, Meth) when is_binary(Url) ->
+    cluster_url(binary_to_list(Url), Meth);
+cluster_url(Url, Meth) when is_list(Url) ->
+    cluster_url(Url, Meth, disco:local_cluster()).
+cluster_url(Url, _Meth, false) -> Url;
+cluster_url(Url, Meth, true) ->
+    Method = string:to_upper(atom_to_list(Meth)),
+    ProxyPort = disco:get_setting("DISCO_PROXY_PORT"),
+    U = binary_to_list(list_to_binary(Url)),
+    {S, HostPort, Path, _Q, _F} = mochiweb_util:urlsplit(U),
+    Host = case string:tokens(HostPort, ":") of
+               [H] -> H;
+               [H|_] -> H
+           end,
+    ProxyUrl = [S, "://127.0.0.1:", ProxyPort, "/proxy/",
+                Host, "/", Method, Path],
+    lists:flatten(ProxyUrl).
+
 -spec safe_rename(string(), string()) -> 'ok' | {'error', 'file_exists'
     | {'chmod_failed', _} | {'rename_failed', _}}.
 safe_rename(Src, Dst) ->
+    safe_rename(std_node, Src, Dst).
+
+-spec safe_rename(s3_node | std_node, string(), string()) -> 'ok' | {'error', 'file_exists'
+    | {'chmod_failed', _} | {'rename_failed', _}}.
+safe_rename(s3_node, Src, Dst) ->
+    safe_rename(std_node, Src, Dst);
+safe_rename(std_node, Src, Dst) ->
     case prim_file:read_file_info(Dst) of
         {error, enoent} ->
             case prim_file:write_file_info(Src,
@@ -173,6 +235,13 @@ concatenate_do(SrcIO, DstIO) ->
 -spec diskspace(nonempty_string()) ->
     {'error', 'invalid_output' | 'invalid_path'} | {'ok', diskinfo()}.
 diskspace(Path) ->
+    diskspace(std_node, Path).
+
+-spec diskspace(s3_node | std_node, nonempty_string()) ->
+    {'error', 'invalid_output' | 'invalid_path'} | {'ok', diskinfo()}.
+diskspace(s3_node, Path) ->
+    diskspace(std_node, Path);
+diskspace(std_node, Path) ->
     case lists:reverse(string:tokens(os:cmd(["df -k ", Path]), "\n\t ")) of
         [_, _, Free, Used|_] ->
             case catch {list_to_integer(Free),
@@ -188,6 +257,12 @@ diskspace(Path) ->
 
 -spec fold_files(string(), fun((string(), string(), T) -> T), T) -> T.
 fold_files(Dir, Fun, Acc0) ->
+    fold_files(std_node, Dir, Fun, Acc0).
+
+-spec fold_files(s3_node | std_node, string(), fun((string(), string(), T) -> T), T) -> T.
+fold_files(s3_node, Dir, Fun, Acc0) ->
+    fold_files(std_node, Dir, Fun, Acc0);
+fold_files(std_node, Dir, Fun, Acc0) ->
     {ok, L} = prim_file:list_dir(Dir),
     lists:foldl(fun(F, Acc) ->
         Path = filename:join(Dir, F),
@@ -212,3 +287,43 @@ choose_random(_, R, 0) -> R;
 choose_random(L, R, N) ->
     C = choose_random(L),
     choose_random(L -- [C], [C|R], N - 1).
+
+-spec read_file(list() | binary()) -> {ok, binary()} | {error, term()}.
+read_file(TagPath) ->
+    read_file(std_node, TagPath).
+
+-spec read_file(s3_node | std_node, list() | binary()) -> {ok, binary()} | {error, term()}.
+read_file(s3_node, TagPath) ->
+    disco_aws:read(get(s3_bucket), TagPath);
+read_file(std_node, TagPath) ->
+    prim_file:read_file(TagPath).
+
+-spec write_file(list() | binary(), binary()) -> ok | {error, term()}.
+write_file(Filename, Data) ->
+    write_file(std_node, Filename, Data).
+
+-spec write_file(s3_node | std_node, list() | binary(), binary()) -> ok | {error, term()}.
+write_file(s3_node, Filename, Data) ->
+    disco_aws:spawn_put(get(s3_bucket), Filename, Data);
+write_file(std_node, Filename, Data) ->
+    prim_file:write_file(Filename, Data).
+
+-spec make_dir(list()) -> ok.
+make_dir(Dir) ->
+    make_dir(std_node, Dir).
+
+-spec make_dir(s3_node | std_node, list()) -> ok.
+make_dir(s3_node, Dir) ->
+    make_dir(std_node, Dir);
+make_dir(std_node, Dir) ->
+    prim_file:make_dir(Dir).
+
+-spec list_dir(list()) -> {ok, list()} | {error, term()}.                         
+list_dir(Root) ->
+    list_dir(std_node, Root).
+
+-spec list_dir(s3_node | std_node, list()) -> {ok, list()} | {error, term()}.          
+list_dir(s3_node, Root) ->
+    disco_aws:list_objects(Root);
+list_dir(std_node, Root) ->
+    prim_file:list_dir(Root).
