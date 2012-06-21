@@ -76,6 +76,16 @@ init(Config) ->
     {get_enabled, GetEnabled} = proplists:lookup(get_enabled, Config),
     {put_enabled, PutEnabled} = proplists:lookup(put_enabled, Config),
 
+    put(use_s3, string:equal(disco:get_setting("DISCO_USE_S3"), "true")),
+
+    case get(use_s3) of
+        true ->
+            put(s3_bucket, disco:get_setting("DISCO_S3_BUCKET")),
+            disco_aws:set_aws_creds();
+        false ->
+            nothing
+    end,
+
     {ok, Vols} = find_vols(DdfsRoot),
     {ok, Tags} = find_tags(DdfsRoot, Vols),
 
@@ -257,7 +267,7 @@ do_get_tag_data(TagId, VolName, From, #state{root = Root}) ->
                                            Root,
                                            VolName),
     TagPath = filename:join(TagDir, binary_to_list(TagId)),
-    case prim_file:read_file(TagPath) of
+    case ddfs_util:read_file(TagPath) of
         {ok, Binary} ->
             gen_server:reply(From, {ok, Binary});
         {error, Reason} ->
@@ -282,7 +292,7 @@ do_put_tag_data(Tag, Data, #state{nodename = NodeName,
         ok ->
             Partial = lists:flatten(["!partial.", binary_to_list(Tag)]),
             Filename = filename:join(Local, Partial),
-            case prim_file:write_file(Filename, Data) of
+            case ddfs_util:write_file(Filename, Data) of
                 ok ->
                     {ok, VolName};
                 {error, _} = E ->
@@ -319,7 +329,7 @@ do_put_tag_commit(Tag, TagVol, #state{nodename = NodeName,
 
 -spec try_makedir(path()) -> ok | error.
 try_makedir(Dir) ->
-    case prim_file:make_dir(Dir) of
+    case ddfs_util:make_dir(Dir) of
         ok ->
             ok;
         {error, eexist} ->
@@ -341,7 +351,7 @@ init_vols(Root, VolNames) ->
 
 -spec find_vols(path()) -> eof | ok | {ok, [volume()]} | {error, _}.
 find_vols(Root) ->
-    case prim_file:list_dir(Root) of
+    case ddfs_util:list_dir(Root) of
         {ok, Files} ->
             case [F || "vol" ++ _ = F <- Files] of
                 [] ->
