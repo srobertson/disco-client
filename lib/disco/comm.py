@@ -19,10 +19,10 @@ except ImportError:
     nocurl = True
 
 if nocurl:
-    from httplib import HTTPConnection
+    from httplib import HTTPConnection,HTTPSConnection
 else:
     from disco import comm_pycurl
-    from disco.comm_pycurl import HTTPConnection
+    from disco.comm_pycurl import HTTPConnection,HTTPSConnection
 
 def isredirection(status):
     return str(status).startswith('3')
@@ -53,9 +53,12 @@ def resolveuri(baseuri, uri):
 
 def request(method, url, data=None, headers={}, sleep=0):
     scheme, netloc, path = urlsplit(urlresolve(url))
-
+    if scheme == 'http':
+        conn_cls = HTTPConnection
+    elif scheme == 'https':
+        conn_cls = HTTPSConnection
     try:
-        conn = HTTPConnection(str(netloc))
+        conn = conn_cls(str(netloc))
         conn.request(method, '/%s' % path, body=data, headers=headers)
         response = conn.getresponse()
         status = response.status
@@ -199,6 +202,8 @@ class Connection(object):
     def __len__(self):
         if 'content-range' in self.headers:
             return int(self.headers['content-range'].split('/')[1])
+        elif self.headers.get('transfer-encoding') == 'chunked':
+            return len(self.buf)
         return int(self.headers.get('content-length', 0))
 
     def close(self):
