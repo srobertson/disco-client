@@ -1,7 +1,12 @@
 -module(disco_proxy).
 -behaviour(gen_server).
 
--export([start/0, stop/0, update_nodes/1]).
+-include("common_types.hrl").
+-include("gs_util.hrl").
+-include("disco.hrl").
+
+
+-export([start/0, update_nodes/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -40,46 +45,50 @@
     "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 ).
 
+-spec start() -> ignore | {ok, pid()}.
 start() ->
     Proxy = disco:get_setting("DISCO_PROXY_ENABLED"),
-    if Proxy =:= "" ->
-        lager:info("Disco proxy disabled"),
-        ignore;
-    true ->
-        lager:info("Disco proxy enabled"),
-        case gen_server:start_link({local, ?MODULE}, ?MODULE, [], []) of
-            {ok, Server} -> {ok, Server};
-            {error, {already_started, Server}} -> {ok, Server}
-        end
+    LocalCluster = disco:local_cluster(),
+    if Proxy =:= "", LocalCluster =:= false ->
+            lager:info("Disco proxy disabled"),
+            ignore;
+       true ->
+            lager:info("Disco proxy enabled"),
+            case gen_server:start_link({local, ?MODULE}, ?MODULE, [], []) of
+                {ok, Server} -> {ok, Server};
+                {error, {already_started, Server}} -> {ok, Server}
+            end
     end.
 
-stop() ->
-    case whereis(?MODULE) of
-        undefined -> ok;
-        _Pid -> gen_server:call(?MODULE, stop)
+-spec update_nodes([host()], port_map()) -> ok.
+update_nodes(Nodes, PortMap) ->
+    Proxy = disco:get_setting("DISCO_PROXY_ENABLED"),
+    LocalCluster = disco:local_cluster(),
+    if Proxy =:= "", LocalCluster =:= false -> ok;
+       true -> gen_server:cast(?MODULE, {update_nodes, Nodes, PortMap})
     end.
 
--spec update_nodes([nonempty_string()]) -> 'ok'.
-update_nodes(Nodes) ->
-    case disco:get_setting("DISCO_PROXY_ENABLED") of
-        "" -> ok;
-        _ -> gen_server:cast(?MODULE, {update_nodes, Nodes})
-    end.
+-type state() :: pid().
 
+-spec init(_) -> gs_init().
 init(_Args) ->
     process_flag(trap_exit, true),
     ProxyMonitor = spawn_link(fun() -> proxy_monitor(start_proxy()) end),
     {ok, ProxyMonitor}.
 
+-spec handle_call(term(), from(), state()) -> gs_noreply().
 handle_call(_Req, _From, S) ->
     {noreply, S}.
 
-handle_cast({update_nodes, Nodes}, ProxyMonitor) ->
-    do_update_nodes(Nodes),
+-spec handle_cast({update_nodes, [host()], port_map()}, state())
+                 -> gs_noreply().
+handle_cast({update_nodes, Nodes, PortMap}, ProxyMonitor) ->
+    do_update_nodes(Nodes, PortMap),
     exit(ProxyMonitor, config_change),
     Monitor = spawn_link(fun() -> proxy_monitor(start_proxy()) end),
     {noreply, Monitor}.
 
+-spec handle_info({'EXIT', pid(), term()}, state()) -> gs_noreply().
 handle_info({'EXIT', ProxyMonitor, Reason}, ProxyMonitor) ->
     lager:warning("Proxy monitor exited: ~p", [Reason]),
     Monitor = spawn_link(fun() -> proxy_monitor(start_proxy()) end),
@@ -90,38 +99,40 @@ handle_info({'EXIT', Other, Reason}, S) ->
     lager:warning("Proxy: received unknown exit from ~p: ~p", [Other, Reason]),
     {noreply, S}.
 
+-spec terminate(term(), state()) -> ok.
 terminate(Reason, _State) ->
-    lager:warning("Disco config dies: ~p", [Reason]).
+    kill_proxy(),
+    lager:warning("Disco proxy dies: ~p", [Reason]).
 
+-spec code_change(term(), state(), term()) -> {ok, state()}.
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
--spec do_update_nodes([nonempty_string()]) -> 'ok'.
-do_update_nodes(Nodes) ->
+-spec do_update_nodes([host()], port_map()) -> ok.
+do_update_nodes(Nodes, PortMap) ->
     DiscoPort = disco:get_setting("DISCO_PORT"),
     Port = disco:get_setting("DISCO_PROXY_PORT"),
     PidFile = disco:get_setting("DISCO_PROXY_PID"),
     Config = disco:get_setting("DISCO_PROXY_CONFIG"),
     Httpd = disco:get_setting("DISCO_HTTPD"),
     Type = filename:basename(string:sub_word(Httpd, 1, $\ )),
-    Body = make_config(Type, Nodes, Port, DiscoPort, PidFile),
+    Body = make_config(Type, Nodes, Port, DiscoPort, PidFile, PortMap),
     ok = file:write_file(Config, Body).
 
 proxy_monitor(Pid) ->
-    case catch string:str(os:cmd(["ps -p", Pid]), Pid) of
-        {'EXIT', {emfile, _}} ->
-            lager:warning("Out of file descriptors! Sleeping.."),
-            sleep(?PROXY_CHECK_INTERVAL),
-            proxy_monitor(Pid);
-        {'EXIT', Error} ->
-            lager:warning("ps failed: ~p", [Error]),
-            exit(ps_failed);
-        0 ->
-            lager:warning("Proxy at pid ~p died", [Pid]),
-            sleep(?PROXY_RESTART_DELAY),
-            exit(proxy_died);
-        _ ->
-            sleep(?PROXY_CHECK_INTERVAL),
-            proxy_monitor(Pid)
+    try
+        case string:str(os:cmd(["ps -p", Pid]), Pid) of
+            0 ->
+                lager:warning("Proxy at pid ~p died", [Pid]),
+                sleep(?PROXY_RESTART_DELAY),
+                exit(proxy_died);
+            _ ->
+                sleep(?PROXY_CHECK_INTERVAL),
+                proxy_monitor(Pid)
+        end
+    catch
+        K:E ->
+            lager:warning("ps failed: ~p:~p", [K, E]),
+            exit(ps_failed)
     end.
 
 start_proxy() ->
@@ -166,27 +177,33 @@ sleep(Timeout) ->
         ok
     end.
 
-resolve_node(Node, Method) ->
+resolve_port(_Host, "GET", none) ->
+    disco:get_setting("DISCO_PORT");
+resolve_port(_Host, "PUT", none) ->
+    disco:get_setting("DDFS_PUT_PORT");
+resolve_port(Host, "GET", {_, PortMap}) ->
+    {GetPort, _PutPort} = gb_trees:get(Host, PortMap),
+    integer_to_list(GetPort);
+resolve_port(Host, "PUT", {_, PortMap}) ->
+    {_GetPort, PutPort} = gb_trees:get(Host, PortMap),
+    integer_to_list(PutPort).
+
+resolve_node(Node, Method, none) ->
     case inet:getaddr(Node, inet) of
         {ok, Ip} ->
-            Port =
-                disco:get_setting(
-                    if Method =:= "GET" ->
-                        "DISCO_PORT";
-                    true ->
-                        "DDFS_PUT_PORT"
-                    end
-                ),
-            {Ip, Port};
+            {Ip, resolve_port(Node, Method, none)};
         _ ->
             lager:warning("Proxy could not resolve node ~p", [Node]),
             false
-    end.
+    end;
+resolve_node(Node, Method, PortMap) ->
+    {{127,0,0,1}, resolve_port(Node, Method, PortMap)}.
 
-make_config("lighttpd", Nodes, Port, DiscoPort, PidFile) ->
+
+make_config("lighttpd", Nodes, Port, DiscoPort, PidFile, PortMap) ->
     Line =
         fun(Node, Method) ->
-            case resolve_node(Node, Method) of
+            case resolve_node(Node, Method, PortMap) of
                 {Ip, NPort} ->
                     io_lib:format(?LIGHTTPD_HOST_TEMPLATE,
                           [Node, Method] ++ tuple_to_list(Ip) ++ [NPort]);
@@ -197,10 +214,10 @@ make_config("lighttpd", Nodes, Port, DiscoPort, PidFile) ->
     Body = lists:flatten([[Line(N, "GET"), Line(N, "PUT")] || N <- Nodes]),
     io_lib:format(?LIGHTTPD_CONFIG_TEMPLATE, [Port, PidFile, Body, DiscoPort]);
 
-make_config("varnishd", Nodes, _Port, DiscoPort, _PidFile) ->
+make_config("varnishd", Nodes, _Port, DiscoPort, _PidFile, PortMap) ->
     Line =
         fun(Node, Method) ->
-            case resolve_node(Node, Method) of
+            case resolve_node(Node, Method, PortMap) of
                 {Ip, NPort} ->
                     Name = varnish_name(Node, Method),
                     BELine = io_lib:format(?VARNISH_BACKEND_TEMPLATE,
@@ -219,7 +236,7 @@ make_config("varnishd", Nodes, _Port, DiscoPort, _PidFile) ->
         lists:flatten([BEGet|BEPut]),
         lists:flatten([CondGet|CondPut])]);
 
-make_config(Type, _Nodes, _Port, _DiscoPort, _PidFile) ->
+make_config(Type, _Nodes, _Port, _DiscoPort, _PidFile, _PortMap) ->
     lager:warning("Unsupported proxy type ~p", [Type]),
     lager:warning("DISCO_HTTPD should be either lighttpd or varnishd!"),
     [].

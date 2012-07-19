@@ -2,6 +2,7 @@
 -module(ddfs_web).
 
 -include("config.hrl").
+-include("ddfs.hrl").
 -include("ddfs_tag.hrl").
 
 -export([op/3]).
@@ -123,13 +124,11 @@ op('GET', "/ddfs/new_blob/" ++ BlobName, Req) ->
 
 op('GET', "/ddfs/tags" ++ Prefix0, Req) ->
     Prefix = list_to_binary(string:strip(Prefix0, both, $/)),
-    case catch ddfs:tags(ddfs_master, Prefix) of
-        {ok, Tags} ->
-            okjson(Tags, Req);
-        {'EXIT', {timeout, _}} ->
-            on_error({error, timeout}, Req);
-        E ->
-            on_error(E, Req)
+    try case ddfs:tags(ddfs_master, Prefix) of
+            {ok, Tags} -> okjson(Tags, Req);
+            E -> on_error(E, Req)
+        end
+    catch K:V -> on_error({K,V}, Req)
     end;
 
 op('GET', "/ddfs/tag/" ++ TagAttrib, Req) ->
@@ -214,9 +213,11 @@ op('DELETE', "/ddfs/tag/" ++ TagAttrib, Req) ->
     end;
 
 op('GET', Path, Req) ->
-    ddfs_get:serve_ddfs_file(Path, Req);
+    DdfsRoot = disco:get_setting("DDFS_DATA"),
+    ddfs_get:serve_ddfs_file(DdfsRoot, Path, Req);
 op('HEAD', Path, Req) ->
-    ddfs_get:serve_ddfs_file(Path, Req);
+    DdfsRoot = disco:get_setting("DDFS_DATA"),
+    ddfs_get:serve_ddfs_file(DdfsRoot, Path, Req);
 
 op(_, _, Req) ->
     Req:not_found().
@@ -283,21 +284,19 @@ okjson(Data, Req) ->
 
 -spec process_payload(fun(([binary()], non_neg_integer()) -> _), module()) -> _.
 process_payload(Fun, Req) ->
-    case catch Req:recv_body(?MAX_TAG_BODY_SIZE) of
-        {'EXIT', _} ->
-            Req:respond({403, [], ["Invalid request."]});
-        BinaryPayload ->
-            case catch mochijson2:decode(BinaryPayload) of
-                {'EXIT', _} ->
-                    Req:respond({403, [], ["Invalid request body."]});
-                Value ->
-                    case Fun(Value, size(BinaryPayload)) of
-                        {ok, Dst} ->
-                            okjson(Dst, Req);
-                        E ->
-                            on_error(E, Req)
-                    end
-            end
+    try  BinaryPayload = Req:recv_body(?MAX_TAG_BODY_SIZE),
+         Payload = try mochijson2:decode(BinaryPayload)
+                   catch _:_ -> invalid end,
+         case Payload of
+             invalid ->
+                 Req:respond({403, [], ["Invalid request body."]});
+             Value ->
+                 case Fun(Value, size(BinaryPayload)) of
+                     {ok, Dst} -> okjson(Dst, Req);
+                     E -> on_error(E, Req)
+                 end
+         end
+    catch _:_ -> Req:respond({403, [], ["Invalid request."]})
     end.
 
 -spec parse_exclude('false' | {'value', {_, string()}}) -> [node()].
