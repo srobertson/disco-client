@@ -292,6 +292,7 @@ init({Root, DeletedAges}) ->
     _ = ets:new(gc_tag_map, [named_table, set, private]),
 
     process_flag(trap_exit, true),
+    put(s3_bucket, disco:get_setting("DISCO_S3_BUCKET")),
     gen_server:cast(self(), start),
     {ok, State}.
 
@@ -329,8 +330,8 @@ handle_cast(start, #state{phase = start} = S) ->
         {ok, Tags, OkNodes} ->
             Phase = build_map,
             Peers = start_gc_peers(OkNodes, self(), now(), Phase),
-
-            Pid = ddfs_gc_node:start_s3_gc_node(self(), now(), Phase),
+            
+            Pid = ddfs_gc_node:start_s3_gc_node(self(), now(), Phase, get(s3_bucket)),
             Peers2 = gb_trees:insert(s3_gc_node, {Pid, 0}, Peers),
 
             % We iterate over the tags by messaging ourselves, so that

@@ -1,6 +1,6 @@
 -module(ddfs_gc_node).
 -export([start_gc_node/4,
-         start_s3_gc_node/3]).
+         start_s3_gc_node/4]).
 
 -include_lib("kernel/include/file.hrl").
 
@@ -16,9 +16,9 @@
 start_gc_node(Node, Master, Now, Phase) ->
     spawn_link(Node, fun () -> gc_node_init(Master, Now, Phase) end).
 
--spec start_s3_gc_node(pid(), erlang:timestamp(), phase()) -> pid().
-start_s3_gc_node(Master, Now, Phase) ->
-    spawn_link(fun () -> s3_gc_node_init(Master, Now, Phase) end).
+-spec start_s3_gc_node(pid(), erlang:timestamp(), phase(), string()) -> pid().
+start_s3_gc_node(Master, Now, Phase, Bucket) ->
+    spawn_link(fun () -> s3_gc_node_init(Master, Now, Phase, Bucket) end).
 
 -spec gc_node_init(pid(), erlang:timestamp(), phase()) -> 'ok'.
 gc_node_init(Master, Now, Phase) ->
@@ -43,9 +43,9 @@ gc_node_init(Master, Now, Phase) ->
     % Now, dispatch to the phase that is running on the master.
     gc_node(Master, Now, Root, Phase).
 
--spec s3_gc_node_init(pid(), erlang:timestamp(), phase()) -> 'ok'.
-s3_gc_node_init(Master, Now, Phase) ->
-    put(s3_bucket, disco:get_setting("DISCO_S3_BUCKET")),
+-spec s3_gc_node_init(pid(), erlang:timestamp(), phase(), string()) -> 'ok'.
+s3_gc_node_init(Master, Now, Phase, Bucket) ->
+    put(s3_bucket, Bucket),
     process_flag(priority, low),
     _ = ets:new(tag, [named_table, set, private]),
     _ = ets:new(blob, [named_table, set, private]),
