@@ -162,7 +162,6 @@ init(_Args) ->
     spawn_link(fun() -> ddfs_gc:start_gc(disco:get_setting("DDFS_DATA")) end),
     Refresher = spawn_link(fun() -> refresh_tag_cache_proc() end),
     put(put_port, disco:get_setting("DDFS_PUT_PORT")),
-    put(use_s3, string:equal(disco:get_setting("DISCO_USE_S3"), "true")),
     put(s3_bucket, disco:get_setting("DISCO_S3_BUCKET")),
     {ok, #state{cache_refresher = Refresher}}.
 
@@ -324,12 +323,12 @@ do_new_blob(_Obj, K, _Exclude, _BlackList, Nodes) when K > length(Nodes) ->
     too_many_replicas;
 do_new_blob(Obj, K, Exclude, BlackList, Nodes) ->
     {ok, WriteNodes} = do_choose_write_nodes(Nodes, K, Exclude, BlackList),
-    Urls = case get(use_s3) of
-               true ->
-                   [lists:flatten(["s3://", get(s3_bucket), "/blob/", Obj]) | 
-                    [["http://", disco:host(N), ":", get(put_port), "/ddfs/", Obj] || N <- WriteNodes]];
-                false ->
-                    [["http://", disco:host(N), ":", get(put_port), "/ddfs/", Obj] || N <- WriteNodes]
+    Urls = case get(s3_bucket) of
+               undefined ->
+                   [["http://", disco:host(N), ":", get(put_port), "/ddfs/", Obj] || N <- WriteNodes];
+               Bucket ->
+                   [lists:flatten(["s3://", Bucket, "/blob/", Obj]) | 
+                    [["http://", disco:host(N), ":", get(put_port), "/ddfs/", Obj] || N <- WriteNodes]]
             end,
     {ok, Urls}.
 
@@ -343,7 +342,8 @@ get_tag_pid(Tag, Tags, Cache) ->
         none ->
             NotFound = (Cache =/= false
                         andalso not gb_sets:is_element(Tag, Cache)),
-            {ok, Server} = ddfs_tag:start(Tag, NotFound),
+            Bucket = get(s3_bucket),
+            {ok, Server} = ddfs_tag:start(Tag, NotFound, Bucket),
             erlang:monitor(process, Server),
             {Server, gb_trees:insert(Tag, Server, Tags)};
         {value, P} ->

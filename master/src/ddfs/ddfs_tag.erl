@@ -9,7 +9,7 @@
 -include("ddfs_tag.hrl").
 -include("gs_util.hrl").
 
--export([start/2, init/1, handle_call/3, handle_cast/2,
+-export([start/2, start/3, init/1, handle_call/3, handle_cast/2,
         handle_info/2, terminate/2, code_change/3]).
 
 -type replica() :: {erlang:timestamp(), nonempty_string()}.
@@ -68,6 +68,10 @@
 
 -spec start(tagname(), boolean()) -> ignore | {error,_} | {ok,pid()}.
 start(TagName, NotFound) ->
+    start(TagName, NotFound, undefined).
+
+-spec start(tagname(), boolean(), string()) -> ignore | {error,_} | {ok,pid()}.
+start(TagName, NotFound, Bucket) ->
     application:start(crypto),
     application:start(public_key),
     application:start(ssl),
@@ -75,27 +79,30 @@ start(TagName, NotFound) ->
     application:start(xmerl),
     application:start(erlcloud),
 
-    gen_server:start(?MODULE, {TagName, NotFound}, []).
+    gen_server:start(?MODULE, {TagName, NotFound, Bucket}, []).
 
--spec init({tagname(), boolean()}) -> gs_init().
+-spec init({tagname(), boolean()} | {tagname(), boolean(), string()}) -> gs_init().
 init({TagName, true}) ->
-    init(TagName, {missing, notfound}, ?TAG_EXPIRES_ONERROR);
+    init(TagName, {missing, notfound}, ?TAG_EXPIRES_ONERROR, undefined);
 init({TagName, false}) ->
-    init(TagName, none, ?TAG_EXPIRES).
+    init(TagName, none, ?TAG_EXPIRES, undefined);
+init({TagName, true, Bucket}) ->
+    init(TagName, {missing, notfound}, ?TAG_EXPIRES_ONERROR, Bucket);
+init({TagName, false, Bucket}) ->
+    init(TagName, none, ?TAG_EXPIRES, Bucket).
 
--spec init(tagname(), none | {missing, notfound}, non_neg_integer()) -> gs_init().
-init(TagName, Data, Timeout) ->
+-spec init(tagname(), none | {missing, notfound}, non_neg_integer(), string()) -> gs_init().
+init(TagName, Data, Timeout, Bucket) ->
     put(min_tagk, list_to_integer(disco:get_setting("DDFS_TAG_MIN_REPLICAS"))),
     put(tagk, list_to_integer(disco:get_setting("DDFS_TAG_REPLICAS"))),
     put(blobk, list_to_integer(disco:get_setting("DDFS_BLOB_REPLICAS"))),
-    put(use_s3, string:equal(disco:get_setting("DISCO_USE_S3"), "true")),
 
-    case get(use_s3) of
-        true ->
-            put(s3_bucket, disco:get_setting("DISCO_S3_BUCKET")),
-            disco_aws:set_aws_creds();
-        false ->
-            nothing
+    case Bucket of
+        undefined ->
+            put(s3_bucket, Bucket);
+        _ ->
+            put(s3_bucket, Bucket),
+            disco_aws:set_aws_creds()
     end,
     
     {ok, #state{tag = TagName,
@@ -679,12 +686,13 @@ put_distribute({TagID, TagData}, K, OkNodes, _Exclude) when K == length(OkNodes)
     {ok, OkNodes};
 
 put_distribute({TagID, TagData} = Msg, K, OkNodes, Exclude) ->
-    case get(use_s3) of
-        true ->
-            disco_aws:put(get(s3_bucket), "tag/"++binary_to_list(TagID), TagData),
+    case get(s3_bucket) of
+        undefined ->
             put_distribute_(Msg, K, OkNodes, Exclude);
-        false ->
+        Bucket ->
+            disco_aws:put(Bucket, "tag/"++binary_to_list(TagID), TagData),
             put_distribute_(Msg, K, OkNodes, Exclude)
+
     end.
 
 -spec put_distribute_({tagid(), binary()}, non_neg_integer(),
