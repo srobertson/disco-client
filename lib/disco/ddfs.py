@@ -14,7 +14,7 @@ from cStringIO import StringIO
 from urllib import urlencode
 
 from disco import json
-from disco.comm import upload, download, open_remote
+from disco.comm import upload, s3_put, download, open_remote
 from disco.error import CommError
 from disco.fileutils import Chunker, CHUNK_SIZE
 from disco.settings import DiscoSettings
@@ -151,6 +151,7 @@ class DDFS(object):
                             retries=retries)
                  for reps in urls
                  for n, chunk in enumerate(chunk_iter(reps))]
+
         return (self.tag(tag,
                          blobs,
                          delayed=delayed,
@@ -369,7 +370,7 @@ class DDFS(object):
 
         try:
             return [json.loads(url)
-                    for url in self._upload(urls, source, **kwargs)]
+                    for url in self._upload(urls, source, to_master=False, **kwargs)]
         except CommError, e:
             scheme, (host, port), path = urlsplit(e.url)
             return self._push((source, target),
@@ -394,15 +395,20 @@ class DDFS(object):
     def _resolve(self, url):
         return urlresolve(url, master=self.master)
 
-    def _download(self, url, data=None, token=None, method='GET'):
+    def _download(self, url, data=None, token=None, method='GET', to_master=True):
         return json.loads(download(self._resolve(proxy_url(url,
                                                            proxy=self.proxy,
-                                                           meth=method)),
+                                                           meth=method,
+                                                           to_master=to_master)),
                                    data=data,
                                    method=method,
                                    token=self._token(url, token, method)))
 
-    def _upload(self, urls, source, token=None, **kwargs):
-        urls = [self._resolve(proxy_url(url, proxy=self.proxy, meth='PUT'))
+    def _upload(self, urls, source, token=None, to_master=True, **kwargs):
+        urls = [self._resolve(proxy_url(url,
+                                        proxy=self.proxy,
+                                        meth='PUT',
+                                        to_master=to_master))
                 for url in iterify(urls)]
+
         return upload(urls, source, token=self._token(url, token, 'PUT'), **kwargs)

@@ -3,14 +3,14 @@
 
 -define(MAX_MESSAGE_LENGTH, 100 * 1024 * 1024).
 
--opaque state() :: 'new_message'
-                 | {'parse_length', binary()}
-                 | {'parse_body', binary(), binary(), non_neg_integer()}.
+-opaque state() :: new_message
+                 | {parse_length, binary()}
+                 | {parse_body, binary(), binary(), non_neg_integer()}.
 
--type parse_result() :: {'ok', {binary(), binary()}, binary(), state()}
-                      | {'error', 'invalid_type' | 'invalid_length'
-                                  | 'message_too_big' | 'invalid_body'}
-                      | {'cont', binary(), state()}.
+-type parse_result() :: {ok, {binary(), binary()}, binary(), state()}
+                      | {error, invalid_type | invalid_length
+                                | message_too_big | invalid_body}
+                      | {cont, binary(), state()}.
 
 -export_type([state/0]).
 
@@ -37,16 +37,17 @@ parse(Buffer, {parse_length, Type} = State) ->
     <<_:TypeLen/binary, Rest/binary>> = Buffer,
     case head(Rest) of
         {ok, LengthStr} ->
-            case catch list_to_integer(binary_to_list(LengthStr)) of
-                {'EXIT', _} ->
-                    {error, invalid_length};
-                Length when Length < 0 ->
-                    {error, invalid_length};
-                Length when Length > ?MAX_MESSAGE_LENGTH ->
-                    {error, message_too_big};
-                Length ->
-                    Total = byte_size(Type) + byte_size(LengthStr) + Length + 3,
-                    parse(Buffer, {parse_body, Type, LengthStr, Total})
+            try
+                case list_to_integer(binary_to_list(LengthStr)) of
+                    Len when Len < 0 ->
+                        {error, invalid_length};
+                    Len when Len > ?MAX_MESSAGE_LENGTH ->
+                        {error, message_too_big};
+                    Len ->
+                        Total = byte_size(Type) + byte_size(LengthStr) + Len + 3,
+                        parse(Buffer, {parse_body, Type, LengthStr, Total})
+                end
+            catch _:_ -> {error, invalid_length}
             end;
         head_missing ->
             {error, invalid_length};
@@ -66,7 +67,7 @@ parse(Buffer, {parse_body, Type, LengthStr, Total}) ->
             {error, invalid_body}
     end.
 
--spec head(binary()) -> {'ok', binary()} | 'head_missing' | 'more_data'.
+-spec head(binary()) -> {ok, binary()} | head_missing | more_data.
 head(<<Head:1/binary, 32, _/binary>>) -> {ok, Head};
 head(<<Head:2/binary, 32, _/binary>>) -> {ok, Head};
 head(<<Head:3/binary, 32, _/binary>>) -> {ok, Head};
